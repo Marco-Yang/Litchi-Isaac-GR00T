@@ -88,10 +88,24 @@ class TimestepEncoder(nn.Module):
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
     def forward(self, timesteps):
+        """Encode flow-matching timesteps.
+
+        Args:
+            timesteps: shape ``(B,)`` (shared) or ``(B, T)`` (per-token, used by
+                training-time RTC so the action prefix can sit at t=1 while the
+                postfix uses the sampled flow time).
+        Returns:
+            ``(B, D)`` or ``(B, T, D)`` matching the input rank.
+        """
         dtype = next(self.parameters()).dtype
-        timesteps_proj = self.time_proj(timesteps).to(dtype)
+        flat = timesteps.reshape(-1)
+        timesteps_proj = self.time_proj(flat).to(dtype)
         timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
-        return timesteps_emb
+        if timesteps.ndim == 1:
+            return timesteps_emb
+        if timesteps.ndim == 2:
+            return timesteps_emb.view(timesteps.shape[0], timesteps.shape[1], -1)
+        raise ValueError(f"Expected timesteps of rank 1 or 2, got shape {tuple(timesteps.shape)}")
 
 
 class AdaLayerNorm(nn.Module):
@@ -115,9 +129,15 @@ class AdaLayerNorm(nn.Module):
         temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         temb = self.linear(self.silu(temb))
-        scale, shift = temb.chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
-        return x
+        # Shared temb: (B, 2D) -> broadcast over sequence.
+        # Per-token temb: (B, T, 2D) -> one scale/shift per token (training-time RTC).
+        if temb.ndim == 2:
+            scale, shift = temb.chunk(2, dim=1)
+            return self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        if temb.ndim == 3:
+            scale, shift = temb.chunk(2, dim=-1)
+            return self.norm(x) * (1 + scale) + shift
+        raise ValueError(f"Expected temb of rank 2 or 3, got shape {tuple(temb.shape)}")
 
 
 class BasicTransformerBlock(nn.Module):
@@ -357,10 +377,19 @@ class DiT(ModelMixin, ConfigMixin):
             hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
             all_hidden_states.append(hidden_states)
 
-        # Output processing
+        # Output processing. Shared temb (B, D) broadcasts; per-token temb (B, T, D)
+        # applies a distinct scale/shift per sequence position.
         conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        if conditioning.ndim == 2:
+            shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+            hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        elif conditioning.ndim == 3:
+            shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=-1)
+            hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
+        else:
+            raise ValueError(
+                f"Expected temb of rank 2 or 3, got shape {tuple(conditioning.shape)}"
+            )
         hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
         output = self.proj_out_2(hidden_states)
         output = _mask_hidden_states(output, hidden_attention_mask)
@@ -444,10 +473,18 @@ class AlternateVLDiT(DiT):
             hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
             all_hidden_states.append(hidden_states)
 
-        # Output processing
+        # Output processing (shared or per-token temb; see DiT.forward).
         conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        if conditioning.ndim == 2:
+            shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+            hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        elif conditioning.ndim == 3:
+            shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=-1)
+            hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
+        else:
+            raise ValueError(
+                f"Expected temb of rank 2 or 3, got shape {tuple(conditioning.shape)}"
+            )
         hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
         output = self.proj_out_2(hidden_states)
         output = _mask_hidden_states(output, hidden_attention_mask)

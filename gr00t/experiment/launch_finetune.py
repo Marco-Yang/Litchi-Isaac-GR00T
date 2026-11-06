@@ -103,6 +103,28 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
+    # Training-time RTC / action-prefix conditioning (arXiv:2512.05964).
+    config.model.rtc_training = ft_config.rtc_training
+    config.model.rtc_execution_horizon = ft_config.rtc_execution_horizon
+    config.model.rtc_max_delay = ft_config.rtc_max_delay
+    config.model.rtc_overlap_steps = ft_config.rtc_overlap_steps
+    config.model.rtc_frozen_steps = ft_config.rtc_frozen_steps
+    config.model.rtc_ramp_rate = ft_config.rtc_ramp_rate
+    if ft_config.rtc_training:
+        H = int(getattr(config.model, "action_horizon", 40))
+        s = int(ft_config.rtc_execution_horizon)
+        dmax = int(ft_config.rtc_max_delay)
+        if dmax > H - s:
+            raise ValueError(
+                f"rtc_max_delay={dmax} violates d <= H - s "
+                f"(H={H}, s={s}, H-s={H - s})"
+            )
+        print(
+            f"Training-time RTC ON: H={H}, s={s}, max_delay={dmax}, "
+            f"deploy_meta overlap={ft_config.rtc_overlap_steps} "
+            f"frozen={ft_config.rtc_frozen_steps} ramp={ft_config.rtc_ramp_rate}"
+        )
+
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"

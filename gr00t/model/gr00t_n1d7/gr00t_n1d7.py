@@ -257,10 +257,47 @@ class Gr00tN1d7ActionHead(nn.Module):
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         if strict_action_mask is not None:
             noise = noise * strict_action_mask
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        B, H, _ = actions.shape
+        t = self.sample_time(B, device=actions.device, dtype=actions.dtype)  # (B,)
 
-        noisy_trajectory = (1 - t) * noise + t * actions
+        # ---- Training-time RTC (arXiv:2512.05964 Algorithm 1) ----
+        # Sample delay d ~ Unif[0, max_delay). Force flow time=1 on the GT
+        # action prefix (hard condition); denoise + lose only the postfix.
+        # When disabled, keep the legacy shared-(B,) timestep path unchanged.
+        rtc_training = bool(getattr(self.config, "rtc_training", False))
+        loss_mask = action_mask
+        if rtc_training:
+            max_delay = int(getattr(self.config, "rtc_max_delay", 0))
+            exec_h = int(getattr(self.config, "rtc_execution_horizon", 1))
+            if max_delay <= 0:
+                max_delay = max(1, H - exec_h)
+            if max_delay > H:
+                raise ValueError(f"rtc_max_delay={max_delay} exceeds action_horizon={H}")
+            delay = torch.randint(0, max_delay, (B,), device=device)
+            prefix_mask = torch.arange(H, device=device)[None, :] < delay[:, None]  # (B, H)
+            per_token_t = t[:, None].expand(B, H).contiguous()
+            per_token_t = torch.where(prefix_mask, torch.ones_like(per_token_t), per_token_t)
+            loss_mask = action_mask * (~prefix_mask).unsqueeze(-1).to(dtype=action_mask.dtype)
+            t_expand = per_token_t.unsqueeze(-1)  # (B, H, 1)
+            encoder_timesteps = (per_token_t * self.num_timestep_buckets).long().clamp(
+                max=self.num_timestep_buckets - 1
+            )  # (B, H)
+            dit_timesteps = torch.cat(
+                (
+                    (t * self.num_timestep_buckets)
+                    .long()
+                    .clamp(max=self.num_timestep_buckets - 1)
+                    .unsqueeze(1),
+                    encoder_timesteps,
+                ),
+                dim=1,
+            )  # (B, 1+H)
+        else:
+            t_expand = t[:, None, None]  # (B, 1, 1)
+            encoder_timesteps = (t * self.num_timestep_buckets).long()  # (B,)
+            dit_timesteps = encoder_timesteps
+
+        noisy_trajectory = (1 - t_expand) * noise + t_expand * actions
         velocity = actions - noise
         action_token_mask = None
         if strict_action_mask is not None:
@@ -268,9 +305,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             velocity = velocity * strict_action_mask
             action_token_mask = strict_action_mask.any(dim=-1)
 
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+        action_features = self.action_encoder(noisy_trajectory, encoder_timesteps, embodiment_id)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -302,7 +337,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
+                timestep=dit_timesteps,
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
@@ -313,7 +348,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask if self.config.strict_vl_padding_mask else None,
-                timestep=t_discretized,
+                timestep=dit_timesteps,
                 return_all_hidden_states=True,
                 hidden_attention_mask=hidden_attention_mask,
             )
@@ -324,13 +359,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             pred_actions = pred_actions * strict_action_mask
 
         # Slice out only the action portion of pred and target.
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        # Under RTC, loss_mask zeroes the prefix so only the postfix is supervised.
+        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * loss_mask
+        loss = action_loss.sum() / (loss_mask.sum() + 1e-6)
 
         return {
             "loss": loss,
             "action_loss": action_loss,
-            "action_mask": action_mask,
+            "action_mask": loss_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }

@@ -212,6 +212,25 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    # --- Training-time RTC (arXiv:2512.05964) ---
+    rtc_training: bool = False
+    """If True, enable training-time action-prefix conditioning (simulate inference delay)."""
+
+    rtc_execution_horizon: int = 12
+    """Execution horizon s. With action_horizon H, max delay is typically H - s."""
+
+    rtc_max_delay: int = 28
+    """Max sampled delay d ~ Unif[0, rtc_max_delay). Must satisfy d <= H - s."""
+
+    rtc_overlap_steps: int = 28
+    """Deployment metadata for inference-time soft RTC (H - s). Not used in the train loss."""
+
+    rtc_frozen_steps: int = 5
+    """Deployment metadata: frozen prefix length ≈ expected inference latency."""
+
+    rtc_ramp_rate: float = 3.0
+    """Deployment metadata: exponential ramp rate for soft RTC overlap."""
+
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:
             raise ValueError(

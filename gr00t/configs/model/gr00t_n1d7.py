@@ -119,6 +119,20 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Training-time Real-Time Chunking (RTC) / action-prefix conditioning
+    # (Black et al., arXiv:2512.05964 — Algorithm 1).
+    # Simulates inference delay d at train time: hard-condition on a GT action
+    # prefix of length d (flow time forced to 1), denoise + lose only the postfix.
+    # Constraint: max_delay <= H - s. Inference-time soft overlap/frozen/ramp are
+    # recorded for deployment docs but are NOT used during training-time RTC.
+    rtc_training: bool = False
+    rtc_execution_horizon: int = 12  # s
+    rtc_max_delay: int = 28  # max d; typically H - s (= overlap)
+    # Optional metadata for async+RTC deployment (inference-time / soft RTC).
+    rtc_overlap_steps: int = 28
+    rtc_frozen_steps: int = 5
+    rtc_ramp_rate: float = 3.0
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True

@@ -88,6 +88,19 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 )
                 if value is not None
             }
+            # Training-time RTC flags must be injected at load time — the base
+            # checkpoint config does not carry them, and action_head reads
+            # getattr(self.config, "rtc_training", False) during forward.
+            rtc_override = {
+                "rtc_training": bool(getattr(self.config.model, "rtc_training", False)),
+                "rtc_execution_horizon": int(
+                    getattr(self.config.model, "rtc_execution_horizon", 12)
+                ),
+                "rtc_max_delay": int(getattr(self.config.model, "rtc_max_delay", 28)),
+                "rtc_overlap_steps": int(getattr(self.config.model, "rtc_overlap_steps", 28)),
+                "rtc_frozen_steps": int(getattr(self.config.model, "rtc_frozen_steps", 5)),
+                "rtc_ramp_rate": float(getattr(self.config.model, "rtc_ramp_rate", 3.0)),
+            }
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -97,6 +110,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 **strict_override,
+                **rtc_override,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
