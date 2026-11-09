@@ -410,7 +410,7 @@ When direct optimization is insufficient, use one or more of the following:
 
 **Recommended strategy**: `Asynchronous Inference + RTC` is usually the most effective.
 
-> **RTC status (experimental):** Asynchronous inference is supported today. RTC is currently only a low-level model primitive: `action_head.get_action(..., options={"rtc_overlap_steps": ..., "rtc_frozen_steps": ..., "rtc_ramp_rate": ...})` with the previous action fed back in (`gr00t/model/gr00t_n1d7/gr00t_n1d7.py`). It is **not wired into `Gr00tPolicy` or the server-client path** (there `options` is currently unused), and it has no tests or ready-made example — so the RTC steps below require manual integration.
+> **RTC status:** `Gr00tPolicy` now caches the previous **normalized** action chunk and, when the client passes `options={action_horizon, rtc_overlap_steps, rtc_frozen_steps, rtc_ramp_rate}`, injects it into `model.get_action` for inpainting. `info["rtc"]` is `True` only when inpainting ran. `reset()` clears the cache (deploy must call this on pause / prompt change / initial-pose). Pair with Litchi `gear_sonic/scripts/run_vla_inference.py --rtc`.
 
 #### Real-Time Chunking (RTC) Details
 

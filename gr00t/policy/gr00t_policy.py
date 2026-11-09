@@ -175,6 +175,18 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
 
+        # Cached normalized action chunk for server-side RTC inpainting.
+        # Deploy clients (e.g. gear_sonic run_vla_inference) send rtc_* options;
+        # the previous chunk must live on the policy server, not the client.
+        self._rtc_prev_normalized_action: torch.Tensor | None = None
+
+    @staticmethod
+    def _rtc_options_ready(options: dict[str, Any] | None) -> bool:
+        if not options:
+            return False
+        required = ("action_horizon", "rtc_overlap_steps", "rtc_frozen_steps", "rtc_ramp_rate")
+        return all(k in options for k in required)
+
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
 
@@ -392,10 +404,14 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional RTC dict from the deploy client:
+                ``action_horizon``, ``rtc_overlap_steps``, ``rtc_frozen_steps``,
+                ``rtc_ramp_rate``. When present and a previous chunk is cached,
+                the previous normalized action is injected for inpainting.
 
         Returns:
-            Tuple of (actions_dict, info_dict)
+            Tuple of (actions_dict, info_dict). ``info["rtc"]`` is True only when
+            inpainting was applied.
         """
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
@@ -413,12 +429,44 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
-        # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
-        normalized_action = model_pred["action_pred"].float()
+        # Step 4: Optional RTC — inject previous normalized action + pass options
+        rtc_applied = False
+        model_options: dict[str, Any] | None = None
+        # BatchFeature is dict-like; materialize a plain dict so we can inject ``action``.
+        if not isinstance(collated_inputs, dict):
+            collated_inputs = dict(collated_inputs)
+        if self._rtc_options_ready(options) and self._rtc_prev_normalized_action is not None:
+            action = self._rtc_prev_normalized_action
+            b = len(unbatched_observations)
+            if action.shape[0] != b:
+                action = action[:1].expand(b, -1, -1).contiguous()
+            target = next(
+                (
+                    v
+                    for v in collated_inputs.values()
+                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v)
+                ),
+                None,
+            )
+            if target is not None:
+                action = action.to(device=target.device, dtype=target.dtype)
+            collated_inputs["action"] = action
+            model_options = dict(options)  # type: ignore[arg-type]
+            rtc_applied = True
 
-        # Step 5: Decode actions from normalized space back to physical units
+        # Step 5: Run model inference to predict actions
+        with torch.inference_mode():
+            # Positional dict matches Gr00tN1d7.get_action(inputs, options).
+            # Fall back to kwargs unpack for older/custom checkpoints.
+            try:
+                model_pred = self.model.get_action(collated_inputs, model_options)
+            except TypeError:
+                model_pred = self.model.get_action(**collated_inputs)
+        normalized_action = model_pred["action_pred"].float()
+        # Always refresh RTC cache (including non-RTC / first chunk).
+        self._rtc_prev_normalized_action = normalized_action.detach()
+
+        # Step 6: Decode actions from normalized space back to physical units
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
@@ -430,7 +478,7 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        return casted_action, {"rtc": rtc_applied}
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
@@ -489,7 +537,9 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
-        return {}
+        del options  # reserved for future reset hooks
+        self._rtc_prev_normalized_action = None
+        return {"rtc_cache_cleared": True}
 
 
 class Gr00tSimPolicyWrapper(PolicyWrapper):
