@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Skill-1: walk_towards_the_green_table — 8-GPU finetune (UNITREE_G1_SONIC)
 #
+# Inputs: ego_view + head cameras + joint/state (see unitree_g1_sonic modality).
 # User params:
 #   lr=1e-4, 4 epochs, save 1 ckpt / epoch, keep last 3, WandB on
-#   Dataset: sessions from 2026-11-05-15-17-43_new .. 2026-11-05-20-36-57
-#   Exclude: 2026-11-05-13-35-11, 2026-11-05-14-05-17, 2026-11-05-14-17-12
+#   Dataset: ALL sessions under walk_towards_the_green_table
+#     (incl. previously excluded 2026-11-05-13-35-11 / 14-05-17 / 14-17-12)
 #
 # Epoch→step mapping (action horizon=40, valid = length-AH+1):
-#   valid steps = 38120, GLOBAL_BATCH_SIZE=32
-#   steps/epoch = 38120 // 32 = 1191
-#   max_steps   = 1191 * 4    = 4764
-#   save_steps  = 1191
+#   14 sessions, valid steps ≈ 59016, GLOBAL_BATCH_SIZE=32
+#   steps/epoch = 59016 // 32 = 1844
+#   max_steps   = 1844 * 4    = 7376
+#   save_steps  = 1844
 #   save_total_limit = 3
 set -euo pipefail
 
@@ -34,26 +35,23 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
 fi
 
 ROOT="/home/zhenyu/workspace/data/demo/dataset/walk_towards_the_green_table"
-EXCLUDE_SESSIONS=(
-  "2026-11-05-13-35-11"
-  "2026-11-05-14-05-17"
-  "2026-11-05-14-17-12"
-)
+# Include real dirs and symlinked session dirs (find -type d skips symlinks).
+# Exclude token-backup folders (not LeRobot sessions).
 DATASET_PATH="$(
-  find "${ROOT}" -mindepth 1 -maxdepth 1 -type d | sort | while read -r d; do
+  {
+    find "${ROOT}" -mindepth 1 -maxdepth 1 -type d
+    find "${ROOT}" -mindepth 1 -maxdepth 1 -type l
+  } | sort -u | while read -r d; do
+    [[ -d "${d}" ]] || continue
     base="$(basename "${d}")"
-    skip=0
-    for ex in "${EXCLUDE_SESSIONS[@]}"; do
-      if [[ "${base}" == "${ex}" ]]; then skip=1; break; fi
-    done
-    if [[ "${skip}" -eq 0 ]]; then
-      printf '%s\n' "${d}"
-    fi
+    [[ "${base}" == _* ]] && continue
+    [[ -f "${d}/meta/info.json" ]] || continue
+    printf '%s\n' "${d}"
   done | paste -sd: -
 )"
 BASE_MODEL_PATH="${GR00T_MODEL_PATH:-${REPO}/checkpoints/GR00T-N1.7-3B}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/walk_towards_the_green_table_skill1}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-walk_towards_green_table_skill1}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/walk_towards_the_green_table_skill1_all_2cam}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-walk_towards_green_table_skill1_all_2cam}"
 WANDB_PROJECT="${WANDB_PROJECT:-finetune-gr00t-n1d7}"
 MASTER_PORT="${MASTER_PORT:-29511}"
 # Bind c10d/TCPStore to loopback. Using the pod hostname previously left
@@ -61,6 +59,9 @@ MASTER_PORT="${MASTER_PORT:-29511}"
 # (seen as: TCP client timed out connecting to <hostname>:<port>).
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 NUM_GPUS="${NUM_GPUS:-8}"
+MAX_STEPS="${MAX_STEPS:-7376}"
+SAVE_STEPS="${SAVE_STEPS:-1844}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
 
 mkdir -p "${OUTPUT_DIR}"
 cd "${REPO}"
@@ -105,7 +106,7 @@ echo "DATASET sessions: $(echo "${DATASET_PATH}" | tr ':' '\n' | wc -l)"
 echo "${DATASET_PATH}" | tr ':' '\n' | sed 's|.*/||' | sed 's/^/  - /'
 echo "BASE_MODEL: ${BASE_MODEL_PATH}"
 echo "OUTPUT_DIR: ${OUTPUT_DIR}"
-echo "NUM_GPUS=${NUM_GPUS}  lr=1e-4  max_steps=4764  save_steps=1191  save_total_limit=3  gbs=32"
+echo "NUM_GPUS=${NUM_GPUS}  lr=1e-4  max_steps=${MAX_STEPS}  save_steps=${SAVE_STEPS}  save_total_limit=${SAVE_TOTAL_LIMIT}  gbs=32"
 echo "RDZV: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "WANDB_MODE=${WANDB_MODE} proxy=${https_proxy:-none}; TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE}; visible GPUs:"
 nvidia-smi -L
@@ -136,9 +137,9 @@ exec torchrun \
   --wandb_project "${WANDB_PROJECT}" \
   --use_wandb \
   --learning_rate 1e-4 \
-  --max_steps 4764 \
-  --save_steps 1191 \
-  --save_total_limit 3 \
+  --max_steps "${MAX_STEPS}" \
+  --save_steps "${SAVE_STEPS}" \
+  --save_total_limit "${SAVE_TOTAL_LIMIT}" \
   --warmup_ratio 0.05 \
   --weight_decay 1e-5 \
   --global_batch_size 32 \

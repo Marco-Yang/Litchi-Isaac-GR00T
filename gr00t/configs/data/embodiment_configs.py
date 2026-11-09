@@ -67,7 +67,9 @@ MODALITY_CONFIGS = {
     "unitree_g1_sonic": {
         "video": ModalityConfig(
             delta_indices=[0],
-            modality_keys=["ego_view"],
+            # Dataset keys: observation.images.ego_view + observation.images.head
+            # (modality.json aliases: ego_view, head — not "head_view")
+            modality_keys=["ego_view", "head"],
         ),
         "state": ModalityConfig(
             delta_indices=[0],
