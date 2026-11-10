@@ -425,16 +425,19 @@ class Gr00tPolicy(BasePolicy):
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
 
-        # Step 3: Collate processed inputs into a single batch for model
+        # Step 3: Collate processed inputs into a single batch for model.
+        # Gr00tN1d7DataCollator returns BatchFeature({"inputs": {...}}); unwrap like
+        # benchmark_inference.py / processor tests so backbone sees input_ids etc.
         collated_inputs = self.collate_fn(processed_inputs)
+        if hasattr(collated_inputs, "keys") and "inputs" in collated_inputs:
+            collated_inputs = collated_inputs["inputs"]
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
-
-        # Step 4: Optional RTC — inject previous normalized action + pass options
-        rtc_applied = False
-        model_options: dict[str, Any] | None = None
-        # BatchFeature is dict-like; materialize a plain dict so we can inject ``action``.
         if not isinstance(collated_inputs, dict):
             collated_inputs = dict(collated_inputs)
+
+        # Step 4: Optional RTC — inject previous normalized action + pass options.
+        rtc_applied = False
+        model_options: dict[str, Any] | None = None
         if self._rtc_options_ready(options) and self._rtc_prev_normalized_action is not None:
             action = self._rtc_prev_normalized_action
             b = len(unbatched_observations)
@@ -456,12 +459,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 5: Run model inference to predict actions
         with torch.inference_mode():
-            # Positional dict matches Gr00tN1d7.get_action(inputs, options).
-            # Fall back to kwargs unpack for older/custom checkpoints.
-            try:
-                model_pred = self.model.get_action(collated_inputs, model_options)
-            except TypeError:
-                model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(collated_inputs, model_options)
         normalized_action = model_pred["action_pred"].float()
         # Always refresh RTC cache (including non-RTC / first chunk).
         self._rtc_prev_normalized_action = normalized_action.detach()

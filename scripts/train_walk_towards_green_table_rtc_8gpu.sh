@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 # Skill-1: walk_towards_the_green_table — 8-GPU finetune WITH training-time RTC
 #
-# Inputs: ego_view + head cameras + joint/state (see unitree_g1_sonic modality).
-# Dataset: ALL sessions under walk_towards_the_green_table
-#   (incl. previously excluded 2026-11-05-13-35-11 / 14-05-17 / 14-17-12)
+# Route (required, mutually exclusive):
+#   --origin | --rewrite | --sim
+# Optional: --skill NAME  (default walk_towards_the_green_table)
+# GATE_ONLY=1 → resolve+validate then exit (no torchrun)
 #
 # Training-time RTC (arXiv:2512.05964 Algorithm 1):
 #   H=40, s=12, max_delay=H-s=28 (=overlap), deploy meta frozen=5, ramp=3.0
-#
-# Match non-RTC schedule: gbs=32, lr=1e-4, 4 epochs, 1 ckpt/epoch, keep last 3.
-# Epoch→step (valid≈59016 with 14 sessions, gbs=32):
-#   steps/epoch = 59016 // 32 = 1844
-#   max_steps   = 1844 * 4    = 7376
-#   save_steps  = 1844
-#   save_total_limit = 3
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VLA_ROOT="$(cd "${REPO}/.." && pwd)"
 
+# shellcheck disable=SC1091
+source "${VLA_ROOT}/scripts/route_lib.sh"
+parse_route_args "$@"
 # shellcheck disable=SC1091
 source "${VLA_ROOT}/activate_gr00t.sh"
 
@@ -35,24 +32,17 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
   exit 1
 fi
 
-ROOT="/home/zhenyu/workspace/data/demo/dataset/walk_towards_the_green_table"
-# Include real dirs and symlinked session dirs (find -type d skips symlinks).
-# Exclude token-backup folders (not LeRobot sessions).
-DATASET_PATH="$(
-  {
-    find "${ROOT}" -mindepth 1 -maxdepth 1 -type d
-    find "${ROOT}" -mindepth 1 -maxdepth 1 -type l
-  } | sort -u | while read -r d; do
-    [[ -d "${d}" ]] || continue
-    base="$(basename "${d}")"
-    [[ "${base}" == _* ]] && continue
-    [[ -f "${d}/meta/info.json" ]] || continue
-    printf '%s\n' "${d}"
-  done | paste -sd: -
-)"
+PY="${PY:-${REPO}/.venv/bin/python}"
+export VALIDATE_PY="${PY}"
+ROOT="$(gate_route_for_use)" || exit 1
+[[ -n "${ROOT}" && -d "${ROOT}" ]] || route_die "route gate failed to resolve dataset root"
+DATASET_PATH="$(dataset_path_colon "${ROOT}")"
+[[ -n "${DATASET_PATH}" ]] || route_die "empty DATASET_PATH under ${ROOT}"
+
+ROUTE_SUFFIX="$(route_output_suffix)"
 BASE_MODEL_PATH="${GR00T_MODEL_PATH:-${REPO}/checkpoints/GR00T-N1.7-3B}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/walk_towards_the_green_table_skill1_all_rtc_2cam}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-walk_towards_green_table_skill1_all_rtc_2cam}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/walk_towards_the_green_table_skill1_all_rtc_2cam${ROUTE_SUFFIX}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-walk_towards_green_table_skill1_all_rtc_2cam${ROUTE_SUFFIX}}"
 WANDB_PROJECT="${WANDB_PROJECT:-finetune-gr00t-n1d7}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29541}"
@@ -61,6 +51,18 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-16}"
 MAX_STEPS="${MAX_STEPS:-7376}"
 SAVE_STEPS="${SAVE_STEPS:-1844}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
+
+echo "ROUTE=${ROUTE} SKILL=${SKILL}"
+echo "POLICY_PACK=$(resolve_policy_pack) WBC_ROOT=$(wbc_root)"
+echo "DATASET_ROOT=${ROOT}"
+if [[ "${GATE_ONLY:-0}" == "1" ]]; then
+  echo "DATASET sessions: $(echo "${DATASET_PATH}" | tr ':' '\n' | wc -l)"
+  echo "${DATASET_PATH}" | tr ':' '\n' | sed 's|.*/||' | sed 's/^/  - /'
+  echo "OUTPUT_DIR=${OUTPUT_DIR}"
+  echo "EXPERIMENT_NAME=${EXPERIMENT_NAME}"
+  echo "[GATE_ONLY] route gate OK; skipping torchrun"
+  exit 0
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 cd "${REPO}"
