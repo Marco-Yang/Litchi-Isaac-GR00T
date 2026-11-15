@@ -66,10 +66,11 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 cd "${REPO}"
 
-# Online wandb needs a live local HTTP proxy; 7890 is often dead on this box.
+# Online wandb: prefer 7897 (same as *_rtc_8gpu.sh). 7890 often 403/dead on this box.
 # Override, e.g.: HTTPS_PROXY=http://127.0.0.1:7897 WANDB_MODE=online bash ...
-PROXY_URL="${HTTPS_PROXY:-${https_proxy:-http://127.0.0.1:7890}}"
-if [[ "${WANDB_MODE:-offline}" == "online" ]]; then
+export WANDB_MODE="${WANDB_MODE:-offline}"
+PROXY_URL="${HTTPS_PROXY:-${https_proxy:-http://127.0.0.1:7897}}"
+if [[ "${WANDB_MODE}" == "online" ]]; then
   export http_proxy="${PROXY_URL}"
   export https_proxy="${PROXY_URL}"
   export HTTP_PROXY="${PROXY_URL}"
@@ -90,7 +91,6 @@ unset CUDA_VISIBLE_DEVICES
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export GROOT_HF_LOCAL_FIRST=1
-export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_START_METHOD=thread
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-120}"
 export WANDB_SILENT=false
@@ -114,7 +114,7 @@ echo "WANDB_API_KEY is set (len=${#WANDB_API_KEY})"
 if [[ "${WANDB_MODE}" == "online" ]]; then
   if ! curl -fsS --max-time 15 -x "${https_proxy}" https://api.wandb.ai/healthz >/dev/null; then
     echo "ERROR: wandb online requested but proxy ${https_proxy} cannot reach api.wandb.ai." >&2
-    echo "       Start the local proxy (or SSH -D/-L tunnel), then rerun with HTTPS_PROXY=..." >&2
+    echo "       Keep local ssh -R up; or HTTPS_PROXY=http://127.0.0.1:7897; or WANDB_MODE=offline." >&2
     exit 2
   fi
   echo "wandb proxy healthz OK via ${https_proxy}"

@@ -141,6 +141,10 @@ class FinetuneConfig:
     """Total batch summed across all GPUs in one forward/backward, BEFORE
     gradient accumulation."""
 
+    per_gpu_batch_size: int | None = None
+    """If set, overrides ``global_batch_size`` as the per-GPU train batch
+    (effective global = per_gpu_batch_size * num_gpus)."""
+
     dataloader_num_workers: int = 2
     """Number of parallel worker processes used for data loading."""
 

@@ -7,7 +7,9 @@
 # GATE_ONLY=1 → resolve+validate then exit (no torchrun)
 #
 # Training-time RTC (arXiv:2512.05964 Algorithm 1):
-#   H=40, s=12, max_delay=H-s=28 (=overlap), deploy meta frozen=5, ramp=3.0
+#   Default: H=40, s=12, max_delay=H-s=28 (=overlap), deploy meta frozen=5, ramp=3.0
+#   Override via env: RTC_EXECUTION_HORIZON / RTC_MAX_DELAY / RTC_OVERLAP_STEPS /
+#                     RTC_FROZEN_STEPS / RTC_RAMP_RATE  (and OUTPUT_DIR / EXPERIMENT_NAME)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,16 +43,42 @@ DATASET_PATH="$(dataset_path_colon "${ROOT}")"
 
 ROUTE_SUFFIX="$(route_output_suffix)"
 BASE_MODEL_PATH="${GR00T_MODEL_PATH:-${REPO}/checkpoints/GR00T-N1.7-3B}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/walk_towards_the_green_table_skill1_all_rtc_2cam${ROUTE_SUFFIX}}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-walk_towards_green_table_skill1_all_rtc_2cam${ROUTE_SUFFIX}}"
 WANDB_PROJECT="${WANDB_PROJECT:-finetune-gr00t-n1d7}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29541}"
 NUM_GPUS="${NUM_GPUS:-8}"
+# Per-rank DataLoader workers (default 16/rank).
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-16}"
-MAX_STEPS="${MAX_STEPS:-7376}"
-SAVE_STEPS="${SAVE_STEPS:-1844}"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
+
+# ---------------------------------------------------------------------------
+# Batch / epoch schedule (same convention as skill1):
+#   NUM_EPOCHS=4, save every epoch (save_steps = steps/epoch), keep latest 4.
+# - skill1: gbs=32, steps/epoch=1844 → max_steps=7376, save_steps=1844, limit=4
+# - pick_toy: per_gpu_batch=32 (gbs=256), steps/epoch scales the prior pick_toy
+#   "1 epoch @ gbs=32" (=98800) by batch so sample exposure/epoch stays comparable.
+# ---------------------------------------------------------------------------
+if [[ "${SKILL}" == "pick_toy" ]]; then
+  OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/skill2_pick_toy_promptfix_b32_e4${ROUTE_SUFFIX}}"
+  EXPERIMENT_NAME="${EXPERIMENT_NAME:-skill2_pick_toy_promptfix_b32_e4${ROUTE_SUFFIX}}"
+  PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-32}"
+  NUM_EPOCHS="${NUM_EPOCHS:-4}"
+  REF_STEPS_PER_EPOCH_GBS32="${REF_STEPS_PER_EPOCH_GBS32:-98800}"
+  GLOBAL_BATCH_SIZE=$((PER_GPU_BATCH_SIZE * NUM_GPUS))
+  STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-$((REF_STEPS_PER_EPOCH_GBS32 * 32 / GLOBAL_BATCH_SIZE))}"
+  MAX_STEPS="${MAX_STEPS:-$((STEPS_PER_EPOCH * NUM_EPOCHS))}"
+  SAVE_STEPS="${SAVE_STEPS:-${STEPS_PER_EPOCH}}"
+  SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-4}"
+else
+  OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/walk_towards_the_green_table_skill1_all_rtc_2cam${ROUTE_SUFFIX}}"
+  EXPERIMENT_NAME="${EXPERIMENT_NAME:-walk_towards_green_table_skill1_all_rtc_2cam${ROUTE_SUFFIX}}"
+  PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-}"
+  GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+  NUM_EPOCHS="${NUM_EPOCHS:-4}"
+  STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-1844}"
+  MAX_STEPS="${MAX_STEPS:-$((STEPS_PER_EPOCH * NUM_EPOCHS))}"
+  SAVE_STEPS="${SAVE_STEPS:-${STEPS_PER_EPOCH}}"
+  SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-4}"
+fi
 
 echo "ROUTE=${ROUTE} SKILL=${SKILL}"
 echo "POLICY_PACK=$(resolve_policy_pack) WBC_ROOT=$(wbc_root)"
@@ -126,7 +154,11 @@ export USE_WANDB=1
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-unset CUDA_VISIBLE_DEVICES
+# Keep an explicit CUDA_VISIBLE_DEVICES (e.g. temporary ablations on free GPUs);
+# otherwise clear so torchrun sees all devices.
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  unset CUDA_VISIBLE_DEVICES
+fi
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export GROOT_HF_LOCAL_FIRST=1
@@ -137,13 +169,26 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MASTER_ADDR MASTER_PORT
 
+BATCH_ARGS=(--global_batch_size "${GLOBAL_BATCH_SIZE}")
+if [[ -n "${PER_GPU_BATCH_SIZE}" ]]; then
+  BATCH_ARGS+=(--per_gpu_batch_size "${PER_GPU_BATCH_SIZE}")
+fi
+
+# RTC knobs (env-overridable; defaults = promptfix / b32_e4)
+RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-12}"
+RTC_MAX_DELAY="${RTC_MAX_DELAY:-28}"
+RTC_OVERLAP_STEPS="${RTC_OVERLAP_STEPS:-28}"
+RTC_FROZEN_STEPS="${RTC_FROZEN_STEPS:-5}"
+RTC_RAMP_RATE="${RTC_RAMP_RATE:-3.0}"
+
 echo "DATASET sessions: $(echo "${DATASET_PATH}" | tr ':' '\n' | wc -l)"
 echo "${DATASET_PATH}" | tr ':' '\n' | sed 's|.*/||' | sed 's/^/  - /'
 echo "BASE_MODEL: ${BASE_MODEL_PATH}"
 echo "OUTPUT_DIR: ${OUTPUT_DIR}"
 echo "RDZV: ${MASTER_ADDR}:${MASTER_PORT}"
-echo "NUM_GPUS=${NUM_GPUS}  gbs=32  lr=1e-4  max_steps=${MAX_STEPS}  save_steps=${SAVE_STEPS}  save_total_limit=${SAVE_TOTAL_LIMIT}  workers=${DATALOADER_NUM_WORKERS}"
-echo "RTC training: H=40 s=12 max_delay=28 | deploy meta overlap=28 frozen=5 ramp=3.0"
+echo "NUM_GPUS=${NUM_GPUS}  per_gpu_batch=${PER_GPU_BATCH_SIZE:-n/a}  gbs=${GLOBAL_BATCH_SIZE}  lr=1e-4"
+echo "epochs=${NUM_EPOCHS}  steps/epoch=${STEPS_PER_EPOCH}  max_steps=${MAX_STEPS}  save=every_epoch(${SAVE_STEPS})  keep_last=${SAVE_TOTAL_LIMIT}  workers=${DATALOADER_NUM_WORKERS}/rank"
+echo "RTC training: H=40 s=${RTC_EXECUTION_HORIZON} max_delay=${RTC_MAX_DELAY} | deploy meta overlap=${RTC_OVERLAP_STEPS} frozen=${RTC_FROZEN_STEPS} ramp=${RTC_RAMP_RATE}"
 echo "WANDB_MODE=${WANDB_MODE}"
 nvidia-smi -L
 
@@ -168,14 +213,18 @@ exec torchrun \
   --save_total_limit "${SAVE_TOTAL_LIMIT}" \
   --warmup_ratio 0.05 \
   --weight_decay 1e-5 \
-  --global_batch_size 32 \
+  "${BATCH_ARGS[@]}" \
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   --shard_size 1024 \
   --num_shards_per_epoch 100000 \
   --episode_sampling_rate 0.1 \
+  --no-tune-llm \
+  --no-tune-visual \
+  --tune-projector \
+  --tune-diffusion-model \
   --rtc_training \
-  --rtc_execution_horizon 12 \
-  --rtc_max_delay 28 \
-  --rtc_overlap_steps 28 \
-  --rtc_frozen_steps 5 \
-  --rtc_ramp_rate 3.0
+  --rtc_execution_horizon "${RTC_EXECUTION_HORIZON}" \
+  --rtc_max_delay "${RTC_MAX_DELAY}" \
+  --rtc_overlap_steps "${RTC_OVERLAP_STEPS}" \
+  --rtc_frozen_steps "${RTC_FROZEN_STEPS}" \
+  --rtc_ramp_rate "${RTC_RAMP_RATE}"
