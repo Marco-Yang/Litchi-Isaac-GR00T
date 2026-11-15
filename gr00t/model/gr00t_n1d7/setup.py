@@ -101,6 +101,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 "rtc_frozen_steps": int(getattr(self.config.model, "rtc_frozen_steps", 5)),
                 "rtc_ramp_rate": float(getattr(self.config.model, "rtc_ramp_rate", 3.0)),
             }
+            # Load joint decoder from base ckpt first; split heads are derived after.
+            # (Base GR00T-N1.7 has a single action_decoder.)
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -120,7 +122,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             missing_keys = loading_info.get("missing_keys", [])
             mask_token_missing = any("mask_token" in key for key in missing_keys)
-            if mask_token_missing and model.action_head.mask_token is not None:
+            if mask_token_missing and getattr(model.action_head, "mask_token", None) is not None:
                 with torch.no_grad():
                     model.action_head.mask_token.data.copy_(
                         0.02 * torch.randn_like(model.action_head.mask_token)
@@ -141,6 +143,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 raise RuntimeError(
                     "Checkpoint weight mismatch for "
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
+                )
+
+            if bool(getattr(self.config.model, "split_hand_body_action_head", False)):
+                head = model.action_head
+                head.body_action_dim = int(getattr(self.config.model, "body_action_dim", 64))
+                head.hand_action_dim = int(getattr(self.config.model, "hand_action_dim", 14))
+                head.body_loss_weight = float(getattr(self.config.model, "body_loss_weight", 1.0))
+                head.hand_loss_weight = float(getattr(self.config.model, "hand_loss_weight", 1.0))
+                head.enable_hand_body_split_from_joint_decoder()
+                # Retune projector flags after module swap.
+                head.set_trainable_parameters(
+                    self.config.model.tune_projector,
+                    self.config.model.tune_diffusion_model,
+                    self.config.model.tune_vlln,
                 )
 
         else:

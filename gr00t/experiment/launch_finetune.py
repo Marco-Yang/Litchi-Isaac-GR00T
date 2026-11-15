@@ -110,6 +110,20 @@ if __name__ == "__main__":
     config.model.rtc_overlap_steps = ft_config.rtc_overlap_steps
     config.model.rtc_frozen_steps = ft_config.rtc_frozen_steps
     config.model.rtc_ramp_rate = ft_config.rtc_ramp_rate
+
+    # Hand / body action-head split (Phi0-style group MSE).
+    config.model.split_hand_body_action_head = ft_config.split_hand_body_action_head
+    config.model.body_action_dim = ft_config.body_action_dim
+    config.model.hand_action_dim = ft_config.hand_action_dim
+    config.model.body_loss_weight = ft_config.body_loss_weight
+    config.model.hand_loss_weight = ft_config.hand_loss_weight
+    if ft_config.split_hand_body_action_head:
+        print(
+            "Hand/body action-head split ON: "
+            f"body_dim={ft_config.body_action_dim} hand_dim={ft_config.hand_action_dim} "
+            f"body_w={ft_config.body_loss_weight} hand_w={ft_config.hand_loss_weight}"
+        )
+
     if ft_config.rtc_training:
         H = int(getattr(config.model, "action_horizon", 40))
         s = int(ft_config.rtc_execution_horizon)

@@ -235,6 +235,23 @@ class FinetuneConfig:
     rtc_ramp_rate: float = 3.0
     """Deployment metadata: exponential ramp rate for soft RTC overlap."""
 
+    # --- Hand / body action-head split (Phi0-style) ---
+    split_hand_body_action_head: bool = False
+    """If True, use separate body/hand action decoders + group MSE weights."""
+
+    body_action_dim: int = 64
+    """Leading action dims for body (motion_token)."""
+
+    hand_action_dim: int = 14
+    """Trailing hand dims (left_hand_joints 7 + right_hand_joints 7)."""
+
+    body_loss_weight: float = 1.0
+    """Weight on mean body-group MSE when split_hand_body_action_head is on."""
+
+    hand_loss_weight: float = 1.0
+    """Weight on mean hand-group MSE. 1.0 with body_loss_weight=1.0 equals
+    group-balanced loss (upweights hand vs flat 64:14 per-dim MSE)."""
+
     def __post_init__(self) -> None:
         if self.gradient_accumulation_steps < 1:
             raise ValueError(

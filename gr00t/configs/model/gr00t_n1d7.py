@@ -125,6 +125,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     # prefix of length d (flow time forced to 1), denoise + lose only the postfix.
     # Constraint: max_delay <= H - s. Inference-time soft overlap/frozen/ramp are
     # recorded for deployment docs but are NOT used during training-time RTC.
+    #
+    # Defaults below match legacy GR00T skill1/skill2. Phi0-aligned recipe
+    # (phi0_wholebody_best_rtc / xperience_unified): s=15, max_delay=8,
+    # frozen≈inference_delay=6, overlap=H-s (25 when H=40). Override via
+    # FinetuneConfig / train script env.
     rtc_training: bool = False
     rtc_execution_horizon: int = 12  # s
     rtc_max_delay: int = 28  # max d; typically H - s (= overlap)
@@ -132,6 +137,16 @@ class Gr00tN1d7Config(PretrainedConfig):
     rtc_overlap_steps: int = 28
     rtc_frozen_steps: int = 5
     rtc_ramp_rate: float = 3.0
+
+    # Hand / body action-head split (UNITREE_G1_SONIC: motion_token64 + hands 7+7).
+    # Shared DiT; separate CategorySpecificMLP decoders + group-balanced MSE.
+    # Phi0 supervises sonic64+revo2 with flat per-dim MSE (body mass ≫ hand).
+    # Equal group weights (1.0/1.0) rebalance so hand mean MSE matches body mean.
+    split_hand_body_action_head: bool = False
+    body_action_dim: int = 64
+    hand_action_dim: int = 14
+    body_loss_weight: float = 1.0
+    hand_loss_weight: float = 1.0
 
     # Training parameters
     tune_projector: bool = True

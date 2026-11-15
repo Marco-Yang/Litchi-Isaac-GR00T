@@ -95,12 +95,39 @@ class Gr00tN1d7ActionHead(nn.Module):
             hidden_size=self.input_embedding_dim,
             num_embodiments=config.max_num_embodiments,
         )
-        self.action_decoder = CategorySpecificMLP(
-            num_categories=config.max_num_embodiments,
-            input_dim=self.hidden_size,
-            hidden_dim=self.hidden_size,
-            output_dim=self.action_dim,
-        )
+        self.split_hand_body = bool(getattr(config, "split_hand_body_action_head", False))
+        self.body_action_dim = int(getattr(config, "body_action_dim", 64))
+        self.hand_action_dim = int(getattr(config, "hand_action_dim", 14))
+        self.body_loss_weight = float(getattr(config, "body_loss_weight", 1.0))
+        self.hand_loss_weight = float(getattr(config, "hand_loss_weight", 1.0))
+        if self.split_hand_body:
+            if self.body_action_dim + self.hand_action_dim > self.action_dim:
+                raise ValueError(
+                    f"body_action_dim({self.body_action_dim})+hand_action_dim"
+                    f"({self.hand_action_dim}) exceeds max_action_dim({self.action_dim})"
+                )
+            self.action_decoder = None
+            self.action_decoder_body = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.body_action_dim,
+            )
+            self.action_decoder_hand = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.hand_action_dim,
+            )
+        else:
+            self.action_decoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.action_dim,
+            )
+            self.action_decoder_body = None
+            self.action_decoder_hand = None
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -150,7 +177,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         if not tune_projector:
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
-            self.action_decoder.requires_grad_(False)
+            if self.action_decoder is not None:
+                self.action_decoder.requires_grad_(False)
+            if self.action_decoder_body is not None:
+                self.action_decoder_body.requires_grad_(False)
+            if self.action_decoder_hand is not None:
+                self.action_decoder_hand.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -179,7 +211,12 @@ class Gr00tN1d7ActionHead(nn.Module):
             if not self.tune_projector:
                 self.state_encoder.eval()
                 self.action_encoder.eval()
-                self.action_decoder.eval()
+                if self.action_decoder is not None:
+                    self.action_decoder.eval()
+                if self.action_decoder_body is not None:
+                    self.action_decoder_body.eval()
+                if self.action_decoder_hand is not None:
+                    self.action_decoder_hand.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -192,6 +229,80 @@ class Gr00tN1d7ActionHead(nn.Module):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
         return sample
+
+    def _decode_actions(self, model_output: torch.Tensor, embodiment_id: torch.Tensor) -> torch.Tensor:
+        """Decode DiT hidden states to full action_dim (pad trailing dims with 0)."""
+        if not self.split_hand_body:
+            return self.action_decoder(model_output, embodiment_id)
+
+        body = self.action_decoder_body(model_output, embodiment_id)
+        hand = self.action_decoder_hand(model_output, embodiment_id)
+        B, T, _ = body.shape
+        out = body.new_zeros(B, T, self.action_dim)
+        bd, hd = self.body_action_dim, self.hand_action_dim
+        out[..., :bd] = body
+        out[..., bd : bd + hd] = hand
+        return out
+
+    def _group_balanced_action_loss(
+        self, action_loss: torch.Tensor, loss_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mean MSE over body/hand groups, then weighted sum (Phi0-style rebalance)."""
+        bd, hd = self.body_action_dim, self.hand_action_dim
+        body_mask = loss_mask[..., :bd]
+        hand_mask = loss_mask[..., bd : bd + hd]
+        body_loss = (action_loss[..., :bd] * body_mask).sum() / (body_mask.sum() + 1e-6)
+        hand_loss = (action_loss[..., bd : bd + hd] * hand_mask).sum() / (hand_mask.sum() + 1e-6)
+        loss = self.body_loss_weight * body_loss + self.hand_loss_weight * hand_loss
+        return loss, body_loss, hand_loss
+
+    @torch.no_grad()
+    def enable_hand_body_split_from_joint_decoder(self) -> None:
+        """Convert a joint ``action_decoder`` into body/hand decoders (finetune init)."""
+        if self.split_hand_body and self.action_decoder is None:
+            return
+        if self.action_decoder is None:
+            raise RuntimeError("enable_hand_body_split_from_joint_decoder needs joint action_decoder")
+
+        bd, hd = self.body_action_dim, self.hand_action_dim
+        joint = self.action_decoder
+        device = joint.layer2.W.device
+        dtype = joint.layer2.W.dtype
+        cfg = self.config
+
+        body = CategorySpecificMLP(
+            num_categories=cfg.max_num_embodiments,
+            input_dim=self.hidden_size,
+            hidden_dim=self.hidden_size,
+            output_dim=bd,
+        ).to(device=device, dtype=dtype)
+        hand = CategorySpecificMLP(
+            num_categories=cfg.max_num_embodiments,
+            input_dim=self.hidden_size,
+            hidden_dim=self.hidden_size,
+            output_dim=hd,
+        ).to(device=device, dtype=dtype)
+
+        body.layer1.W.data.copy_(joint.layer1.W.data)
+        body.layer1.b.data.copy_(joint.layer1.b.data)
+        hand.layer1.W.data.copy_(joint.layer1.W.data)
+        hand.layer1.b.data.copy_(joint.layer1.b.data)
+        body.layer2.W.data.copy_(joint.layer2.W.data[:, :, :bd])
+        body.layer2.b.data.copy_(joint.layer2.b.data[:, :bd])
+        hand.layer2.W.data.copy_(joint.layer2.W.data[:, :, bd : bd + hd])
+        hand.layer2.b.data.copy_(joint.layer2.b.data[:, bd : bd + hd])
+
+        self.action_decoder_body = body
+        self.action_decoder_hand = hand
+        self.action_decoder = None
+        self.split_hand_body = True
+        self.config.split_hand_body_action_head = True
+        self.config.body_action_dim = bd
+        self.config.hand_action_dim = hd
+        logger.info(
+            "Split hand/body action decoders from joint head "
+            f"(body={bd}, hand={hd}, body_w={self.body_loss_weight}, hand_w={self.hand_loss_weight})"
+        )
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
@@ -353,7 +464,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_attention_mask=hidden_attention_mask,
             )
 
-        pred = self.action_decoder(model_output, embodiment_id)
+        pred = self._decode_actions(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
         if strict_action_mask is not None:
             pred_actions = pred_actions * strict_action_mask
@@ -361,15 +472,23 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         # Under RTC, loss_mask zeroes the prefix so only the postfix is supervised.
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * loss_mask
-        loss = action_loss.sum() / (loss_mask.sum() + 1e-6)
+        if self.split_hand_body:
+            loss, body_loss, hand_loss = self._group_balanced_action_loss(action_loss, loss_mask)
+        else:
+            loss = action_loss.sum() / (loss_mask.sum() + 1e-6)
+            body_loss = hand_loss = None
 
-        return {
+        out = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": loss_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+        if body_loss is not None:
+            out["body_action_loss"] = body_loss
+            out["hand_action_loss"] = hand_loss
+        return out
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -546,7 +665,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     ),
                     hidden_attention_mask=hidden_attention_mask,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
+            pred = self._decode_actions(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
             if action_mask is not None:

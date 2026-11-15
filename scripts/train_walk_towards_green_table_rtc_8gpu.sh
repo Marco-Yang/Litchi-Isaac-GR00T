@@ -7,9 +7,12 @@
 # GATE_ONLY=1 → resolve+validate then exit (no torchrun)
 #
 # Training-time RTC (arXiv:2512.05964 Algorithm 1):
-#   Default: H=40, s=12, max_delay=H-s=28 (=overlap), deploy meta frozen=5, ramp=3.0
+#   Branch default (Phi0-aligned): H=40, s=15, max_delay=8, overlap=H-s=25,
+#   frozen=6 (=Phi0 inference_delay), ramp=3.0
 #   Override via env: RTC_EXECUTION_HORIZON / RTC_MAX_DELAY / RTC_OVERLAP_STEPS /
-#                     RTC_FROZEN_STEPS / RTC_RAMP_RATE  (and OUTPUT_DIR / EXPERIMENT_NAME)
+#                     RTC_FROZEN_STEPS / RTC_RAMP_RATE
+#   Hand/body split (Phi0-style): SPLIT_HAND_BODY_ACTION_HEAD=1 (default on this
+#   branch), BODY/HAND_ACTION_DIM, BODY/HAND_LOSS_WEIGHT (group-mean MSE).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,8 +61,8 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-16}"
 #   "1 epoch @ gbs=32" (=98800) by batch so sample exposure/epoch stays comparable.
 # ---------------------------------------------------------------------------
 if [[ "${SKILL}" == "pick_toy" ]]; then
-  OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/skill2_pick_toy_promptfix_b32_e4${ROUTE_SUFFIX}}"
-  EXPERIMENT_NAME="${EXPERIMENT_NAME:-skill2_pick_toy_promptfix_b32_e4${ROUTE_SUFFIX}}"
+  OUTPUT_DIR="${OUTPUT_DIR:-/home/zhenyu/workspace/data/demo/outputs/skill2_pick_toy_hand_body_split${ROUTE_SUFFIX}}"
+  EXPERIMENT_NAME="${EXPERIMENT_NAME:-skill2_pick_toy_hand_body_split${ROUTE_SUFFIX}}"
   PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-32}"
   NUM_EPOCHS="${NUM_EPOCHS:-4}"
   REF_STEPS_PER_EPOCH_GBS32="${REF_STEPS_PER_EPOCH_GBS32:-98800}"
@@ -174,12 +177,30 @@ if [[ -n "${PER_GPU_BATCH_SIZE}" ]]; then
   BATCH_ARGS+=(--per_gpu_batch_size "${PER_GPU_BATCH_SIZE}")
 fi
 
-# RTC knobs (env-overridable; defaults = promptfix / b32_e4)
-RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-12}"
-RTC_MAX_DELAY="${RTC_MAX_DELAY:-28}"
-RTC_OVERLAP_STEPS="${RTC_OVERLAP_STEPS:-28}"
-RTC_FROZEN_STEPS="${RTC_FROZEN_STEPS:-5}"
+# RTC knobs — Phi0-aligned defaults (phi0_wholebody_best_rtc / xperience_unified)
+RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-15}"
+RTC_MAX_DELAY="${RTC_MAX_DELAY:-8}"
+RTC_OVERLAP_STEPS="${RTC_OVERLAP_STEPS:-25}"   # H=40 - s=15
+RTC_FROZEN_STEPS="${RTC_FROZEN_STEPS:-6}"      # Phi0 inference_delay
 RTC_RAMP_RATE="${RTC_RAMP_RATE:-3.0}"
+
+# Hand/body split — equal group-mean MSE (upweights hand vs flat 64:14)
+SPLIT_HAND_BODY_ACTION_HEAD="${SPLIT_HAND_BODY_ACTION_HEAD:-1}"
+BODY_ACTION_DIM="${BODY_ACTION_DIM:-64}"
+HAND_ACTION_DIM="${HAND_ACTION_DIM:-14}"
+BODY_LOSS_WEIGHT="${BODY_LOSS_WEIGHT:-1.0}"
+HAND_LOSS_WEIGHT="${HAND_LOSS_WEIGHT:-1.0}"
+
+HAND_BODY_ARGS=()
+if [[ "${SPLIT_HAND_BODY_ACTION_HEAD}" == "1" || "${SPLIT_HAND_BODY_ACTION_HEAD}" == "true" ]]; then
+  HAND_BODY_ARGS+=(
+    --split_hand_body_action_head
+    --body_action_dim "${BODY_ACTION_DIM}"
+    --hand_action_dim "${HAND_ACTION_DIM}"
+    --body_loss_weight "${BODY_LOSS_WEIGHT}"
+    --hand_loss_weight "${HAND_LOSS_WEIGHT}"
+  )
+fi
 
 echo "DATASET sessions: $(echo "${DATASET_PATH}" | tr ':' '\n' | wc -l)"
 echo "${DATASET_PATH}" | tr ':' '\n' | sed 's|.*/||' | sed 's/^/  - /'
@@ -188,7 +209,8 @@ echo "OUTPUT_DIR: ${OUTPUT_DIR}"
 echo "RDZV: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "NUM_GPUS=${NUM_GPUS}  per_gpu_batch=${PER_GPU_BATCH_SIZE:-n/a}  gbs=${GLOBAL_BATCH_SIZE}  lr=1e-4"
 echo "epochs=${NUM_EPOCHS}  steps/epoch=${STEPS_PER_EPOCH}  max_steps=${MAX_STEPS}  save=every_epoch(${SAVE_STEPS})  keep_last=${SAVE_TOTAL_LIMIT}  workers=${DATALOADER_NUM_WORKERS}/rank"
-echo "RTC training: H=40 s=${RTC_EXECUTION_HORIZON} max_delay=${RTC_MAX_DELAY} | deploy meta overlap=${RTC_OVERLAP_STEPS} frozen=${RTC_FROZEN_STEPS} ramp=${RTC_RAMP_RATE}"
+echo "RTC training (Phi0-aligned defaults): H=40 s=${RTC_EXECUTION_HORIZON} max_delay=${RTC_MAX_DELAY} | deploy meta overlap=${RTC_OVERLAP_STEPS} frozen=${RTC_FROZEN_STEPS} ramp=${RTC_RAMP_RATE}"
+echo "Hand/body split=${SPLIT_HAND_BODY_ACTION_HEAD} body_dim=${BODY_ACTION_DIM} hand_dim=${HAND_ACTION_DIM} body_w=${BODY_LOSS_WEIGHT} hand_w=${HAND_LOSS_WEIGHT}"
 echo "WANDB_MODE=${WANDB_MODE}"
 nvidia-smi -L
 
@@ -227,4 +249,5 @@ exec torchrun \
   --rtc_max_delay "${RTC_MAX_DELAY}" \
   --rtc_overlap_steps "${RTC_OVERLAP_STEPS}" \
   --rtc_frozen_steps "${RTC_FROZEN_STEPS}" \
-  --rtc_ramp_rate "${RTC_RAMP_RATE}"
+  --rtc_ramp_rate "${RTC_RAMP_RATE}" \
+  "${HAND_BODY_ARGS[@]}"
